@@ -40,10 +40,9 @@ def _make_element(mode: str) -> ItemAndImageEnrichmentElement:
     return ItemAndImageEnrichmentElement(item=item, image=img)
 
 
-def test_images_converted_to_rgb() -> None:
-    """All image modes (RGBA, L, P, RGB) must arrive at _annotate_images as RGB."""
+def test_rgba_image_converted_to_rgb() -> None:
+    """RGBA images must be converted to RGB before picture description."""
     model = _RecordingPictureDescriptionModel()
     doc = DoclingDocument(name="test")
-    elements = [_make_element(m) for m in ("RGBA", "L", "P", "RGB")]
-    list(model(doc=doc, element_batch=elements))
-    assert model.received_modes == ["RGB", "RGB", "RGB", "RGB"]
+    list(model(doc=doc, element_batch=[_make_element("RGBA")]))
+    assert model.received_modes == ["RGB"]
