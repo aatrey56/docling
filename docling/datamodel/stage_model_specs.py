@@ -595,6 +595,7 @@ class StagePresetMixin:
         preset = cls.get_preset(preset_id)
 
         # Create engine options if not provided
+        trust_remote = preset.model_spec.trust_remote_code
         if engine_options is None:
             if preset.default_engine_type == VlmEngineType.AUTO_INLINE:
                 engine_options = AutoInlineVlmEngineOptions()
@@ -603,11 +604,17 @@ class StagePresetMixin:
                     engine_type=preset.default_engine_type
                 )
             elif preset.default_engine_type == VlmEngineType.TRANSFORMERS:
-                engine_options = TransformersVlmEngineOptions()
+                engine_options = TransformersVlmEngineOptions(
+                    trust_remote_code=trust_remote,
+                )
             elif preset.default_engine_type == VlmEngineType.MLX:
-                engine_options = MlxVlmEngineOptions()
+                engine_options = MlxVlmEngineOptions(
+                    trust_remote_code=trust_remote,
+                )
             elif preset.default_engine_type == VlmEngineType.VLLM:
-                engine_options = VllmVlmEngineOptions()
+                engine_options = VllmVlmEngineOptions(
+                    trust_remote_code=trust_remote,
+                )
             else:
                 engine_options = AutoInlineVlmEngineOptions()
 
@@ -894,7 +901,7 @@ PIXTRAL_MODEL_SPEC_BASE = {
         VlmEngineType.MLX: EngineModelConfig(repo_id="mlx-community/pixtral-12b-bf16"),
         VlmEngineType.TRANSFORMERS: EngineModelConfig(
             extra_config={
-                "transformers_model_type": TransformersModelType.AUTOMODEL_VISION2SEQ,
+                "transformers_model_type": TransformersModelType.AUTOMODEL_IMAGETEXTTOTEXT,
             }
         ),
     },
@@ -957,7 +964,7 @@ IMAGE_CLASSIFICATION_DOCUMENT_FIGURE = ImageClassificationStagePreset(
     description="EfficientNet model for classifying document pictures",
     model_spec=ImageClassificationModelSpec(
         name="document_figure_classifier_v2",
-        repo_id="docling-project/DocumentFigureClassifier-v2.0",
+        repo_id="docling-project/DocumentFigureClassifier-v2.5",
         revision="main",
     ),
     default_engine_type=ImageClassificationEngineType.TRANSFORMERS,
@@ -1191,6 +1198,109 @@ VLM_CONVERT_DOLPHIN = StageModelPreset(
         },
     ),
     scale=2.0,
+    default_engine_type=VlmEngineType.AUTO_INLINE,
+)
+
+VLM_CONVERT_GLMOCR = StageModelPreset(
+    preset_id="glm_ocr",
+    name="GLM-OCR",
+    description="Zhipu GLM-OCR model for text recognition and markdown conversion (0.9B parameters)",
+    model_spec=VlmModelSpec(
+        name="GLM-OCR-0.9B",
+        default_repo_id="zai-org/GLM-OCR",
+        prompt="Text Recognition:",
+        response_format=ResponseFormat.MARKDOWN,
+        engine_overrides={
+            VlmEngineType.TRANSFORMERS: EngineModelConfig(
+                torch_dtype="bfloat16",
+                extra_config={
+                    "transformers_model_type": TransformersModelType.AUTOMODEL_IMAGETEXTTOTEXT,
+                    "transformers_prompt_style": TransformersPromptStyle.CHAT,
+                    "torch_dtype": "bfloat16",
+                },
+            ),
+            # No MLX export available yet; when one appears on mlx-community,
+            # add: VlmEngineType.MLX: EngineModelConfig(repo_id="mlx-community/GLM-OCR-...")
+        },
+        api_overrides={
+            VlmEngineType.API: ApiModelConfig(
+                params={"model": "zai-org/GLM-OCR", "max_tokens": 4096}
+            ),
+            VlmEngineType.API_OPENAI: ApiModelConfig(
+                params={"model": "glm-ocr", "max_tokens": 4096}
+            ),
+        },
+    ),
+    scale=2.0,
+    default_engine_type=VlmEngineType.AUTO_INLINE,
+)
+
+VLM_CONVERT_FALCON_OCR = StageModelPreset(
+    preset_id="falcon_ocr",
+    name="Falcon-OCR",
+    description="TII Falcon-OCR model for text recognition and markdown conversion (0.3B parameters)",
+    model_spec=VlmModelSpec(
+        name="Falcon-OCR",
+        default_repo_id="tiiuae/Falcon-OCR",
+        prompt="",
+        response_format=ResponseFormat.MARKDOWN,
+        trust_remote_code=True,
+        engine_overrides={
+            VlmEngineType.TRANSFORMERS: EngineModelConfig(
+                torch_dtype="bfloat16",
+                extra_config={
+                    "transformers_model_type": TransformersModelType.AUTOMODEL_CAUSALLM,
+                    "transformers_prompt_style": TransformersPromptStyle.CHAT,
+                    "torch_dtype": "bfloat16",
+                },
+            ),
+            # No MLX export available yet; when one appears on mlx-community,
+            # add: VlmEngineType.MLX: EngineModelConfig(repo_id="mlx-community/Falcon-OCR-...")
+        },
+        api_overrides={
+            VlmEngineType.API_LMSTUDIO: ApiModelConfig(
+                params={"model": "falcon-ocr", "max_tokens": 4096}
+            ),
+            VlmEngineType.API_OPENAI: ApiModelConfig(
+                params={"model": "falcon-ocr", "max_tokens": 4096}
+            ),
+        },
+    ),
+    scale=2.0,
+    default_engine_type=VlmEngineType.AUTO_INLINE,
+)
+
+VLM_CONVERT_LIGHTONOCR = StageModelPreset(
+    preset_id="lightonocr",
+    name="LightOnOCR-2-1B",
+    description="LightOn LightOnOCR-2 model for OCR and markdown conversion (1B parameters)",
+    model_spec=VlmModelSpec(
+        name="LightOnOCR-2-1B",
+        default_repo_id="lightonai/LightOnOCR-2-1B",
+        prompt="",
+        response_format=ResponseFormat.MARKDOWN,
+        max_new_tokens=4096,
+        engine_overrides={
+            VlmEngineType.TRANSFORMERS: EngineModelConfig(
+                torch_dtype="bfloat16",
+                extra_config={
+                    "transformers_model_type": TransformersModelType.AUTOMODEL_IMAGETEXTTOTEXT,
+                    "transformers_prompt_style": TransformersPromptStyle.CHAT,
+                    "torch_dtype": "bfloat16",
+                },
+            ),
+        },
+        api_overrides={
+            VlmEngineType.API: ApiModelConfig(
+                params={"model": "lightonai/LightOnOCR-2-1B", "max_tokens": 4096}
+            ),
+            VlmEngineType.API_OPENAI: ApiModelConfig(
+                params={"model": "lightonocr-2-1b", "max_tokens": 4096}
+            ),
+        },
+    ),
+    scale=2.0,
+    max_size=1540,
     default_engine_type=VlmEngineType.AUTO_INLINE,
 )
 

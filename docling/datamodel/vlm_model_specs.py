@@ -167,7 +167,7 @@ GRANITE_VISION_TRANSFORMERS = InlineVlmOptions(
     prompt="Convert this page to markdown. Do not miss any text and only output the bare markdown!",
     response_format=ResponseFormat.MARKDOWN,
     inference_framework=InferenceFramework.TRANSFORMERS,
-    transformers_model_type=TransformersModelType.AUTOMODEL_VISION2SEQ,
+    transformers_model_type=TransformersModelType.AUTOMODEL_IMAGETEXTTOTEXT,
     supported_devices=[
         AcceleratorDevice.CPU,
         AcceleratorDevice.CUDA,
@@ -207,7 +207,7 @@ PIXTRAL_12B_TRANSFORMERS = InlineVlmOptions(
     prompt="Convert this page to markdown. Do not miss any text and only output the bare markdown!",
     response_format=ResponseFormat.MARKDOWN,
     inference_framework=InferenceFramework.TRANSFORMERS,
-    transformers_model_type=TransformersModelType.AUTOMODEL_VISION2SEQ,
+    transformers_model_type=TransformersModelType.AUTOMODEL_IMAGETEXTTOTEXT,
     supported_devices=[
         AcceleratorDevice.CPU,
         AcceleratorDevice.CUDA,
@@ -317,6 +317,79 @@ DOLPHIN_TRANSFORMERS = InlineVlmOptions(
     temperature=0.0,
 )
 
+# GLM-OCR
+GLMOCR_TRANSFORMERS = InlineVlmOptions(
+    repo_id="zai-org/GLM-OCR",
+    prompt="Text Recognition:",
+    response_format=ResponseFormat.MARKDOWN,
+    inference_framework=InferenceFramework.TRANSFORMERS,
+    transformers_model_type=TransformersModelType.AUTOMODEL_IMAGETEXTTOTEXT,
+    transformers_prompt_style=TransformersPromptStyle.CHAT,
+    supported_devices=[
+        AcceleratorDevice.CUDA,
+        AcceleratorDevice.CPU,
+        AcceleratorDevice.MPS,
+        AcceleratorDevice.XPU,
+    ],
+    torch_dtype="bfloat16",
+    scale=2.0,
+    temperature=0.0,
+)
+
+GLMOCR_VLLM = GLMOCR_TRANSFORMERS.model_copy(deep=True)
+GLMOCR_VLLM.inference_framework = InferenceFramework.VLLM
+
+GLMOCR_VLLM_API = ApiVlmOptions(
+    url="http://localhost:8000/v1/chat/completions",
+    params=dict(
+        model="zai-org/GLM-OCR",
+        max_tokens=4096,
+    ),
+    prompt="Text Recognition:",
+    timeout=90,
+    scale=2.0,
+    temperature=0.0,
+    concurrency=4,
+    response_format=ResponseFormat.MARKDOWN,
+)
+
+# LightOnOCR
+LIGHTONOCR_TRANSFORMERS = InlineVlmOptions(
+    repo_id="lightonai/LightOnOCR-2-1B",
+    prompt="",
+    response_format=ResponseFormat.MARKDOWN,
+    inference_framework=InferenceFramework.TRANSFORMERS,
+    transformers_model_type=TransformersModelType.AUTOMODEL_IMAGETEXTTOTEXT,
+    transformers_prompt_style=TransformersPromptStyle.CHAT,
+    supported_devices=[
+        AcceleratorDevice.CUDA,
+        AcceleratorDevice.CPU,
+        AcceleratorDevice.MPS,
+        AcceleratorDevice.XPU,
+    ],
+    torch_dtype="bfloat16",
+    scale=2.0,
+    temperature=0.0,
+    max_new_tokens=4096,
+)
+
+LIGHTONOCR_VLLM = LIGHTONOCR_TRANSFORMERS.model_copy(deep=True)
+LIGHTONOCR_VLLM.inference_framework = InferenceFramework.VLLM
+
+LIGHTONOCR_VLLM_API = ApiVlmOptions(
+    url="http://localhost:8000/v1/chat/completions",
+    params=dict(
+        model="lightonai/LightOnOCR-2-1B",
+        max_tokens=4096,
+    ),
+    prompt="",
+    timeout=90,
+    scale=2.0,
+    temperature=0.0,
+    concurrency=4,
+    response_format=ResponseFormat.MARKDOWN,
+)
+
 # DeepSeek-OCR
 DEEPSEEKOCR_OLLAMA = ApiVlmOptions(
     url="http://localhost:11434/v1/chat/completions",
@@ -362,4 +435,8 @@ class VlmModelType(str, Enum):
     GOT_OCR_2 = "got_ocr_2"
     GRANITEDOCLING = "granite_docling"
     GRANITEDOCLING_VLLM = "granite_docling_vllm"
+    GLMOCR = "glm_ocr"
+    GLMOCR_VLLM = "glm_ocr_vllm"
+    LIGHTONOCR = "lightonocr"
+    LIGHTONOCR_VLLM = "lightonocr_vllm"
     DEEPSEEKOCR_OLLAMA = "deepseekocr_ollama"
