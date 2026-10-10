@@ -1,14 +1,13 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
+from __future__ import annotations
+
 import logging
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, Callable
 
-if TYPE_CHECKING:
-    from io import BytesIO
-    from pathlib import Path
-    from typing import Any
-
-import pypdfium2
 from docling_core.types.doc.document import (
     DocItemLabel,
     DoclingDocument,
@@ -17,19 +16,12 @@ from docling_core.types.doc.document import (
     NodeItem,
 )
 from PIL import Image
-from pylatexenc.latexwalker import (
-    LatexCharsNode,
-    LatexEnvironmentNode,
-    LatexGroupNode,
-    LatexMacroNode,
-    LatexWalker,
-    LatexWalkerParseError,
-)
 
 from docling.backend.latex.constants import (
     MACROS_ACCENTS,
     MACROS_CITATION,
     MACROS_COLOR,
+    MACROS_COLOR_INLINE,
     MACROS_ESCAPED,
     MACROS_HEADING,
     MACROS_IGNORED,
@@ -42,13 +34,50 @@ from docling.backend.latex.constants import (
     MACROS_TEXT_FORMATTING,
     MACROS_TEXT_STYLE,
 )
+from docling.backend.latex.utils.encoding import decode_latex_content
+from docling.backend.latex.utils.latex_context import LATEX_CONTEXT_DB
+from docling.backend.latex.utils.text import iter_child_nodelists
+from docling.backend.utils.image import normalize_image_for_png
+
+if TYPE_CHECKING:
+    from typing import Any
+
+try:  # pragma: no cover - import-time guard
+    from pylatexenc.latexwalker import (
+        LatexCharsNode,
+        LatexEnvironmentNode,
+        LatexGroupNode,
+        LatexMacroNode,
+        LatexWalker,
+        LatexWalkerParseError,
+    )
+except ImportError:
+    pass  # guarded by LatexDocumentBackend.__init__
 
 _log = logging.getLogger(__name__)
+
+# pypdfium2 ships with the PDF extras, not with format-latex. Only \includegraphics
+# of a .pdf file needs it, so guard the import and report it on that path instead
+# of breaking every LaTeX conversion at import time.
+# See https://github.com/docling-project/docling/issues/3613.
+_PYPDFIUM2_AVAILABLE: bool = False
+_PYPDFIUM2_IMPORT_ERROR: ImportError | None = None
+try:  # pragma: no cover - import-time guard
+    import pypdfium2
+
+    _PYPDFIUM2_AVAILABLE = True
+except ImportError as e:  # pragma: no cover - import-time guard
+    _PYPDFIUM2_IMPORT_ERROR = e
+
+_PYPDFIUM2_INSTALL_HINT = (
+    "The 'pypdfium2' package is required to embed PDF images from LaTeX "
+    "sources. Install it with `pip install 'docling-slim[format-pdf-pypdfium2]'`."
+)
 
 
 class MacroHandlerMixin:
     if TYPE_CHECKING:
-        path_or_stream: "BytesIO | Path"
+        _source_dir: Path | None
         _input_stack: set[str]
         _custom_macros: dict[str, str]
         _custom_macro_num_args: dict[str, int]
@@ -56,13 +85,14 @@ class MacroHandlerMixin:
 
         def _process_nodes(
             self,
-            nodes: "Any",
-            doc: "Any",
-            parent: "Any" = ...,
-            formatting: "Any" = ...,
-            text_label: "Any" = ...,
+            nodes: Any,
+            doc: Any,
+            parent: Any = ...,
+            formatting: Any = ...,
+            text_label: Any = ...,
         ) -> None: ...
-        def _nodes_to_text(self, nodes: "Any") -> str: ...
+        def _nodes_to_text(self, nodes: Any) -> str: ...
+        def _item_term(self, node: Any) -> str: ...
 
     def _preprocess_custom_macros(self, latex_text: str) -> str:
         latex_text = re.sub(r"\\be\b", r"\\begin{equation}", latex_text)
@@ -99,7 +129,7 @@ class MacroHandlerMixin:
                             macro_name = macro_name[1:]
 
                         macro_def = ""
-                        if hasattr(def_arg, "nodelist"):
+                        if isinstance(def_arg, LatexGroupNode):
                             macro_def = def_arg.latex_verbatim()
                             if macro_def.startswith("{") and macro_def.endswith("}"):
                                 macro_def = macro_def[1:-1]
@@ -115,14 +145,8 @@ class MacroHandlerMixin:
                                 f"Registered custom macro: \\{macro_name} -> '{macro_def}'"
                             )
 
-            if hasattr(node, "nodelist") and node.nodelist:
-                self._extract_custom_macros(node.nodelist, depth + 1)
-            if hasattr(node, "nodeargd") and node.nodeargd:
-                argnlist = getattr(node.nodeargd, "argnlist", None)
-                if argnlist:
-                    for arg in argnlist:
-                        if hasattr(arg, "nodelist") and arg.nodelist:
-                            self._extract_custom_macros(arg.nodelist, depth + 1)
+            for child_nodes in iter_child_nodelists(node):
+                self._extract_custom_macros(child_nodes, depth + 1)
 
     def _extract_preamble_metadata(self, nodes, doc: DoclingDocument, depth: int = 0):
         if nodes is None or depth > 10:
@@ -143,16 +167,20 @@ class MacroHandlerMixin:
                     else:
                         doc.add_text(label=DocItemLabel.TEXT, text=text)
 
-            if hasattr(node, "nodelist") and node.nodelist:
-                self._extract_preamble_metadata(node.nodelist, doc, depth + 1)
-            if hasattr(node, "nodeargd") and node.nodeargd:
-                argnlist = getattr(node.nodeargd, "argnlist", None)
-                if argnlist:
-                    for arg in argnlist:
-                        if hasattr(arg, "nodelist") and arg.nodelist:
-                            self._extract_preamble_metadata(
-                                arg.nodelist, doc, depth + 1
-                            )
+            for child_nodes in iter_child_nodelists(node):
+                self._extract_preamble_metadata(child_nodes, doc, depth + 1)
+
+    def _process_item_macro_inline(
+        self,
+        node: LatexMacroNode,
+        text_buffer: list[str],
+        following_nodes=None,
+    ) -> None:
+        term = self._item_term(node)
+        if term:
+            text_buffer.append(f"{term}: ")
+            if following_nodes and isinstance(following_nodes[0], LatexCharsNode):
+                following_nodes[0].chars = following_nodes[0].chars.lstrip()
 
     def _process_macro_node_inline(
         self,
@@ -161,7 +189,7 @@ class MacroHandlerMixin:
         parent: NodeItem | None,
         formatting: Formatting | None,
         text_label: DocItemLabel | None,
-        text_buffer: List[str],
+        text_buffer: list[str],
         flush_fn: Callable[[], None],
         following_nodes=None,
     ) -> int:
@@ -199,6 +227,21 @@ class MacroHandlerMixin:
                 text_buffer.append(url_text)
         elif node.macroname in MACROS_COLOR:
             pass
+        elif node.macroname in MACROS_TEXT_STYLE:
+            formatted_text = self._extract_macro_arg(node)
+            if formatted_text:
+                text_buffer.append(formatted_text)
+        elif node.macroname in MACROS_COLOR_INLINE:
+            # Skip the color argument; the text content is always the last arg
+            if node.nodeargd and node.nodeargd.argnlist:
+                text_arg = node.nodeargd.argnlist[-1]
+                if isinstance(text_arg, LatexGroupNode):
+                    text = self._nodes_to_text(text_arg.nodelist)
+                    if text:
+                        text_buffer.append(text)
+        elif node.macroname == "item":
+            flush_fn()
+            self._process_item_macro_inline(node, text_buffer, following_nodes)
         else:
             if node.macroname in MACROS_STRUCTURAL:
                 flush_fn()
@@ -253,7 +296,7 @@ class MacroHandlerMixin:
         elif node.macroname in MACROS_TEXT_STYLE:
             if node.nodeargd and node.nodeargd.argnlist:
                 arg = node.nodeargd.argnlist[-1]
-                if hasattr(arg, "nodelist"):
+                if isinstance(arg, LatexGroupNode):
                     self._process_nodes(
                         arg.nodelist, doc, parent, formatting, text_label
                     )
@@ -293,11 +336,27 @@ class MacroHandlerMixin:
             if img_path:
                 image = None
                 try:
-                    if isinstance(self.path_or_stream, Path):
-                        img_full_path = self.path_or_stream.parent / img_path
+                    if self._source_dir is not None:
+                        base_dir = self._source_dir.resolve()
+                        img_full_path = self._source_dir / img_path
+                        try:
+                            if not img_full_path.resolve().is_relative_to(base_dir):
+                                _log.warning(
+                                    f"Path traversal attempt blocked for image: {img_path}"
+                                )
+                                raise ValueError("Path traversal not allowed")
+                        except ValueError:
+                            _log.warning(
+                                f"Invalid path for image (different drive or traversal): {img_path}"
+                            )
+                            raise
                         if img_full_path.exists():
                             suffix = img_full_path.suffix.lower()
                             if suffix == ".pdf":
+                                if not _PYPDFIUM2_AVAILABLE:
+                                    raise ImportError(
+                                        _PYPDFIUM2_INSTALL_HINT
+                                    ) from _PYPDFIUM2_IMPORT_ERROR
                                 pdf = pypdfium2.PdfDocument(img_full_path)
                                 page = pdf[0]
                                 pil_image = page.render(scale=2).to_pil()
@@ -315,7 +374,9 @@ class MacroHandlerMixin:
                                 _log.debug(
                                     f"Loaded image {img_path}: {pil_image.size}, DPI={dpi}"
                                 )
-                            image = ImageRef.from_pil(image=pil_image, dpi=int(dpi))
+                            image = ImageRef.from_pil(
+                                image=normalize_image_for_png(pil_image), dpi=int(dpi)
+                            )
                 except Exception as e:
                     _log.debug(f"Could not load image {img_path}: {e}")
 
@@ -339,10 +400,24 @@ class MacroHandlerMixin:
             from pylatexenc.latexwalker import LatexWalker
 
             filepath = self._extract_macro_arg(node)
-            if filepath and isinstance(self.path_or_stream, Path):
-                input_path = self.path_or_stream.parent / filepath
+            if filepath and self._source_dir is not None:
+                base_dir = self._source_dir.resolve()
+                input_path = self._source_dir / filepath
                 if not input_path.suffix:
                     input_path = input_path.with_suffix(".tex")
+
+                try:
+                    if not input_path.resolve().is_relative_to(base_dir):
+                        _log.warning(
+                            f"Path traversal attempt blocked for input file: {filepath}"
+                        )
+                        return
+                except ValueError:
+                    _log.warning(
+                        f"Invalid path for input file (different drive or traversal): {filepath}"
+                    )
+                    return
+
                 resolved = str(input_path.resolve())
                 if resolved in self._input_stack:
                     _log.warning(f"Circular \\input detected: {filepath}")
@@ -353,8 +428,12 @@ class MacroHandlerMixin:
                 elif input_path.exists():
                     self._input_stack.add(resolved)
                     try:
-                        content = input_path.read_text(encoding="utf-8")
-                        sub_walker = LatexWalker(content, tolerant_parsing=True)
+                        content = decode_latex_content(input_path)
+                        sub_walker = LatexWalker(
+                            content,
+                            tolerant_parsing=True,
+                            latex_context=LATEX_CONTEXT_DB,
+                        )
                         sub_nodes, _, _ = sub_walker.get_latex_nodes()
                         self._process_nodes(
                             sub_nodes, doc, parent, formatting, text_label
@@ -394,14 +473,14 @@ class MacroHandlerMixin:
 
                 url_text = ""
                 if url_arg is not None:
-                    if hasattr(url_arg, "nodelist"):
+                    if isinstance(url_arg, LatexGroupNode):
                         url_text = self._nodes_to_text(url_arg.nodelist)
                     else:
                         url_text = url_arg.latex_verbatim().strip("{} ")
 
                 display_text = ""
                 if text_arg is not None:
-                    if hasattr(text_arg, "nodelist"):
+                    if isinstance(text_arg, LatexGroupNode):
                         display_text = self._nodes_to_text(text_arg.nodelist)
                     else:
                         display_text = text_arg.latex_verbatim().strip("{} ")
@@ -438,7 +517,7 @@ class MacroHandlerMixin:
         elif node.macroname in ["textcolor", "colorbox"]:
             if node.nodeargd and node.nodeargd.argnlist:
                 for arg in reversed(node.nodeargd.argnlist):
-                    if arg is not None and hasattr(arg, "nodelist"):
+                    if isinstance(arg, LatexGroupNode):
                         self._process_nodes(
                             arg.nodelist, doc, parent, formatting, text_label
                         )
@@ -451,7 +530,7 @@ class MacroHandlerMixin:
             if node.nodeargd and node.nodeargd.argnlist:
                 processed_any = False
                 for arg in node.nodeargd.argnlist:
-                    if hasattr(arg, "nodelist"):
+                    if isinstance(arg, LatexGroupNode):
                         self._process_nodes(
                             arg.nodelist, doc, parent, formatting, text_label
                         )
@@ -468,7 +547,7 @@ class MacroHandlerMixin:
         if node.nodeargd and node.nodeargd.argnlist:
             arg = node.nodeargd.argnlist[-1]
             if arg:
-                if hasattr(arg, "nodelist"):
+                if isinstance(arg, LatexGroupNode):
                     return self._nodes_to_text(arg.nodelist)
                 return arg.latex_verbatim().strip("{} ")
         return ""
@@ -478,7 +557,7 @@ class MacroHandlerMixin:
             if 0 <= index < len(node.nodeargd.argnlist):
                 arg = node.nodeargd.argnlist[index]
                 if arg:
-                    if hasattr(arg, "nodelist"):
+                    if isinstance(arg, LatexGroupNode):
                         return self._nodes_to_text(arg.nodelist)
                     return arg.latex_verbatim().strip("{} ")
         return ""
@@ -487,7 +566,7 @@ class MacroHandlerMixin:
         if node.nodeargd and node.nodeargd.argnlist:
             if 0 <= index < len(node.nodeargd.argnlist):
                 arg = node.nodeargd.argnlist[index]
-                if arg and hasattr(arg, "nodelist"):
+                if isinstance(arg, LatexGroupNode):
                     return arg.nodelist
         return []
 
@@ -498,7 +577,7 @@ class MacroHandlerMixin:
         parts = []
         for arg in node.nodeargd.argnlist:
             if arg is not None:
-                if hasattr(arg, "nodelist"):
+                if isinstance(arg, LatexGroupNode):
                     text = self._nodes_to_text(arg.nodelist)
                     if text:
                         parts.append(text)
@@ -566,7 +645,9 @@ class MacroHandlerMixin:
 
     def _parse_latex_fragment_to_text(self, latex_fragment: str) -> str:
         try:
-            walker = LatexWalker(latex_fragment, tolerant_parsing=True)
+            walker = LatexWalker(
+                latex_fragment, tolerant_parsing=True, latex_context=LATEX_CONTEXT_DB
+            )
             parsed_nodes, _, _ = walker.get_latex_nodes()
         except LatexWalkerParseError:
             return latex_fragment

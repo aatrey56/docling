@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
 """Tests for API KServe v2 remote engine scaffolding."""
 
 from __future__ import annotations
@@ -22,6 +25,8 @@ from docling.models.inference_engines.image_classification import (
 from docling.models.inference_engines.object_detection import (
     create_object_detection_engine,
 )
+
+pytestmark = pytest.mark.cross_platform
 
 
 def test_object_detection_factory_requires_remote_enablement() -> None:

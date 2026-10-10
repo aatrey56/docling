@@ -1,7 +1,12 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
+
 def ocr_engines():
     from docling.models.stages.ocr.auto_ocr_model import OcrAutoModel
     from docling.models.stages.ocr.easyocr_model import EasyOcrModel
     from docling.models.stages.ocr.kserve_v2_ocr_model import KserveV2OcrModel
+    from docling.models.stages.ocr.nemotron_ocr_model import NemotronOcrModel
     from docling.models.stages.ocr.ocr_mac_model import OcrMacModel
     from docling.models.stages.ocr.rapid_ocr_model import RapidOcrModel
     from docling.models.stages.ocr.tesseract_ocr_cli_model import TesseractOcrCliModel
@@ -12,6 +17,7 @@ def ocr_engines():
             OcrAutoModel,
             EasyOcrModel,
             KserveV2OcrModel,
+            NemotronOcrModel,
             OcrMacModel,
             RapidOcrModel,
             TesseractOcrModel,
@@ -62,6 +68,9 @@ def table_structure_engines():
     from docling.models.stages.table_structure.table_structure_model import (
         TableStructureModel,
     )
+    from docling.models.stages.table_structure.table_structure_model_granite_vision import (
+        GraniteVisionTableStructureModel,
+    )
     from docling.models.stages.table_structure.table_structure_model_v2 import (
         TableStructureModelV2,
     )
@@ -70,5 +79,6 @@ def table_structure_engines():
         "table_structure_engines": [
             TableStructureModel,
             TableStructureModelV2,
+            GraniteVisionTableStructureModel,
         ]
     }

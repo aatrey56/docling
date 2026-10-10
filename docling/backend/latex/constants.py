@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
 MACROS_NEWCOMMAND = frozenset(["newcommand", "renewcommand", "providecommand"])
 
 MACROS_PREAMBLE_METADATA = frozenset(["title", "author", "date"])
@@ -9,6 +12,8 @@ MACROS_TEXT_FORMATTING = frozenset(["textbf", "textit", "emph", "texttt", "under
 MACROS_CITATION = frozenset(["cite", "citep", "citet", "ref", "eqref"])
 
 MACROS_COLOR = frozenset(["color", "definecolor", "colorlet"])
+
+MACROS_COLOR_INLINE = frozenset(["textcolor", "colorbox"])
 
 MACROS_STRUCTURAL = frozenset(
     [
@@ -255,5 +260,10 @@ TABLE_MACROS_IGNORE = frozenset(
         "hphantom",
         "vphantom",
         "noalign",
+        # longtable repeating header/footer markers are not cell content
+        "endhead",
+        "endfirsthead",
+        "endfoot",
+        "endlastfoot",
     ]
 )

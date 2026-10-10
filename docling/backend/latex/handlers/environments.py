@@ -1,35 +1,67 @@
-from typing import TYPE_CHECKING, Optional
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
 
-if TYPE_CHECKING:
-    from typing import Any
+from __future__ import annotations
 
+import logging
+import re
+from pathlib import Path
+from typing import TYPE_CHECKING, Optional, cast
+
+from docling_core.types.doc import CodeLanguageLabel
 from docling_core.types.doc.document import (
+    CodeMetaField,
     DocItemLabel,
     DoclingDocument,
     Formatting,
     GroupLabel,
     NodeItem,
+    PictureMeta,
 )
-from pylatexenc.latexwalker import LatexEnvironmentNode, LatexMacroNode
 
 from docling.backend.latex.constants import ENV_LIST, ENV_MATH, ENV_QUOTE, ENV_THEOREM
+from docling.backend.latex.utils.text import iter_child_nodelists
+
+if TYPE_CHECKING:
+    from concurrent.futures import Future, ThreadPoolExecutor
+    from typing import Any
+
+    from docling.backend.latex.engines.tectonic import TectonicEngine
+    from docling.datamodel.backend_options import (
+        BaseBackendOptions,
+        LatexBackendOptions,
+    )
+
+try:  # pragma: no cover - import-time guard
+    from pylatexenc.latexwalker import LatexEnvironmentNode, LatexMacroNode
+except ImportError:
+    pass  # guarded by LatexDocumentBackend.__init__
+
+_log = logging.getLogger(__name__)
+_TIKZ_END_PATTERN = re.compile(r"\\end\s*\{\s*tikzpicture\s*\}")
 
 
 class EnvironmentHandlerMixin:
     if TYPE_CHECKING:
+        options: BaseBackendOptions
+        latex_preamble: str
+        _source_dir: Path | None
+        _tectonic_engine: TectonicEngine | None
+        _tikz_executor: ThreadPoolExecutor | None
+        _tikz_futures: list[Future[Any]]
 
         def _process_nodes(
             self,
-            nodes: "Any",
-            doc: "Any",
-            parent: "Any" = ...,
-            formatting: "Any" = ...,
-            text_label: "Any" = ...,
+            nodes: Any,
+            doc: Any,
+            parent: Any = ...,
+            formatting: Any = ...,
+            text_label: Any = ...,
         ) -> None: ...
         def _clean_math(self, latex_str: str, env_name: str) -> str: ...
-        def _parse_table(self, node: "Any") -> "Any": ...
+        def _parse_table(self, node: Any) -> Any: ...
         def _extract_verbatim_content(self, latex_str: str, env_name: str) -> str: ...
-        def _extract_macro_arg(self, node: "Any") -> str: ...
+        def _extract_macro_arg(self, node: Any) -> str: ...
 
     def _find_document_env(self, nodes, depth: int = 0):
         if nodes is None or depth > 10:
@@ -37,18 +69,10 @@ class EnvironmentHandlerMixin:
         for node in nodes:
             if isinstance(node, LatexEnvironmentNode) and node.envname == "document":
                 return node
-            if hasattr(node, "nodelist") and node.nodelist:
-                result = self._find_document_env(node.nodelist, depth + 1)
+            for child_nodes in iter_child_nodelists(node):
+                result = self._find_document_env(child_nodes, depth + 1)
                 if result:
                     return result
-            if hasattr(node, "nodeargd") and node.nodeargd:
-                argnlist = getattr(node.nodeargd, "argnlist", None)
-                if argnlist:
-                    for arg in argnlist:
-                        if hasattr(arg, "nodelist") and arg.nodelist:
-                            result = self._find_document_env(arg.nodelist, depth + 1)
-                            if result:
-                                return result
         return None
 
     def _process_environment(
@@ -107,7 +131,7 @@ class EnvironmentHandlerMixin:
         elif node.envname in ENV_LIST:
             self._process_list(node, doc, parent, formatting, text_label)
 
-        elif node.envname == "tabular":
+        elif node.envname in {"tabular", "tabular*", "tabularx", "longtable"}:
             table_data = self._parse_table(node)
             if table_data:
                 doc.add_table(parent=parent, data=table_data)
@@ -117,6 +141,9 @@ class EnvironmentHandlerMixin:
 
         elif node.envname in ["figure", "figure*"]:
             self._process_figure(node, doc, parent, formatting, text_label)
+
+        elif node.envname == "tikzpicture":
+            self._process_tikzpicture(node, doc, parent, formatting, text_label)
 
         elif node.envname in ["verbatim", "lstlisting", "minted"]:
             code_text = self._extract_verbatim_content(
@@ -133,6 +160,111 @@ class EnvironmentHandlerMixin:
 
         else:
             self._process_nodes(node.nodelist, doc, parent, formatting, text_label)
+
+    def _process_tikzpicture(
+        self,
+        node: LatexEnvironmentNode,
+        doc: DoclingDocument,
+        parent: NodeItem | None = None,
+        formatting: Formatting | None = None,
+        text_label: DocItemLabel | None = None,
+    ):
+        tikz_raw = self._extract_tikzpicture_atomic(node)
+        if tikz_raw is None:
+            _log.warning(
+                "tikzpicture extraction failed, using recursive environment fallback"
+            )
+            self._process_nodes(node.nodelist, doc, parent, formatting, text_label)
+            return
+
+        opts = cast("LatexBackendOptions", self.options)
+        if opts.tikz_engine == "tectonic":
+            try:
+                from docling.backend.latex.engines.tectonic import TectonicEngine
+
+                if self._tectonic_engine is None:
+                    self._tectonic_engine = TectonicEngine(
+                        timeout=opts.tikz_engine_timeout,
+                        allow_shell_escape=opts.tikz_engine_allow_shell_escape,
+                    )
+
+                pic = doc.add_picture(parent=parent)
+
+                def render_task(engine, raw_tikz, picture_item, preamble, source_root):
+                    def set_code_fallback():
+                        picture_item.meta = PictureMeta(
+                            code=CodeMetaField(
+                                text=raw_tikz,
+                                language=CodeLanguageLabel.TIKZ,
+                            )
+                        )
+
+                    try:
+                        img_ref = engine.render(
+                            raw_tikz, preamble=preamble, source_root=source_root
+                        )
+                        if img_ref:
+                            picture_item.image = img_ref
+                        else:
+                            # Any Tectonic failure should degrade to raw TikZ.
+                            set_code_fallback()
+                    except Exception as e:
+                        _log.warning(f"Async Tectonic rendering failed: {e}")
+                        set_code_fallback()
+
+                preamble = self.latex_preamble
+                source_root = self._source_dir
+                if self._tikz_executor:
+                    future = self._tikz_executor.submit(
+                        render_task,
+                        self._tectonic_engine,
+                        tikz_raw,
+                        pic,
+                        preamble,
+                        source_root,
+                    )
+                    self._tikz_futures.append(future)
+                else:
+                    render_task(
+                        self._tectonic_engine, tikz_raw, pic, preamble, source_root
+                    )
+                return
+            except Exception as e:
+                _log.warning(f"Failed to setup Tectonic async task: {e}")
+
+        pic = doc.add_picture(parent=parent)
+        pic.meta = PictureMeta(
+            code=CodeMetaField(
+                text=tikz_raw,
+                language=CodeLanguageLabel.TIKZ,
+            )
+        )
+
+    def _extract_tikzpicture_atomic(self, node: LatexEnvironmentNode) -> str | None:
+        raw = node.latex_verbatim()
+        if _TIKZ_END_PATTERN.search(raw) is None:
+            return None
+        if not self._validate_tikz_nodelist(node.nodelist, 0):
+            return None
+        return raw
+
+    def _validate_tikz_nodelist(self, nodes, depth: int = 0) -> bool:
+        if nodes is None:
+            return True
+        if depth > 50:
+            return False
+
+        for node in nodes:
+            if isinstance(node, LatexEnvironmentNode) and node.envname == "tikzpicture":
+                nested_raw = node.latex_verbatim()
+                if _TIKZ_END_PATTERN.search(nested_raw) is None:
+                    return False
+
+            for child_nodes in iter_child_nodelists(node):
+                if not self._validate_tikz_nodelist(child_nodes, depth + 1):
+                    return False
+
+        return True
 
     def _process_figure(
         self,

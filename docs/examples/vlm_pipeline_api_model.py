@@ -428,7 +428,7 @@ def main():
     logging.basicConfig(level=logging.INFO)
 
     data_folder = Path(__file__).parent / "../../tests/data"
-    input_doc_path = data_folder / "pdf/2305.03393v1-pg9.pdf"
+    input_doc_path = data_folder / "pdf/sources/2305.03393v1-pg9.pdf"
 
     # Track which examples ran
     results = {
@@ -508,6 +508,7 @@ if __name__ == "__main__":
 # - **got_ocr**: GOT-OCR (Markdown format)
 # - **phi4**: Phi-4 (Markdown format)
 # - **qwen**: Qwen (Markdown format)
+# - **nanonets_ocr2**: Nanonets OCR2 (Markdown format)
 # - **gemma_12b**: Gemma 12B (Markdown format)
 # - **gemma_27b**: Gemma 27B (Markdown format)
 # - **dolphin**: Dolphin (Markdown format)

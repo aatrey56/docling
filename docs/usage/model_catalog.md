@@ -34,7 +34,7 @@ The following table shows all processing stages in Docling, their model families
           <li><code>docling-layout-egret-medium</code></li>
           <li><code>docling-layout-egret-large</code></li>
           <li><code>docling-layout-egret-xlarge</code></li>
-          <li><code>docling-layout-v2</code> (legacy)</li>
+          <li><code>docling-layout-v2</code> (legacy, no longer supported)</li>
         </ul>
       </td>
     </tr>
@@ -85,6 +85,21 @@ The following table shows all processing stages in Docling, their model families
     </tr>
     <tr>
       <td rowspan="3"><strong>Table Structure</strong><br/><em>Table cell recognition</em></td>
+      <td rowspan="3">Vision-Language Model<br/>(Granite Vision)</td>
+      <td>
+        <ul>
+          <li><code>granite-vision-4.1-4b</code></li>
+        </ul>
+      </td>
+    </tr>
+    <tr>
+      <td colspan="2"><strong>Inference Engine:</strong> Transformers</td>
+    </tr>
+    <tr>
+      <td colspan="2"><strong>Purpose:</strong> VLM-based table structure recognition using OTSL (Open Table Structure Language) output</td>
+    </tr>
+    <tr>
+      <td rowspan="3"><strong>Table Structure</strong><br/><em>Table cell recognition</em></td>
       <td rowspan="3">Object Detection</td>
       <td>
         <ul>
@@ -126,6 +141,7 @@ The following table shows all processing stages in Docling, their model families
           <li><strong>GOT-OCR-2.0</strong> (Markdown)</li>
           <li><strong>Phi-4-Multimodal</strong> (Markdown)</li>
           <li><strong>Qwen2.5-VL-3B</strong> (Markdown)</li>
+          <li><strong>Nanonets-OCR2-3B</strong> (Markdown)</li>
           <li><strong>Gemma-3-12B/27B</strong> (Markdown, MLX-only)</li>
           <li><strong>Dolphin</strong> (Markdown)</li>
         </ul>
@@ -183,9 +199,14 @@ The following table shows all processing stages in Docling, their model families
 
 | Model | Inference Engine | Supported Devices |
 |-------|------------------|-------------------|
-| All Layout models | docling-ibm-models | CPU, CUDA, MPS, XPU |
+| All layout models | Transformers | CPU, CUDA, MPS, XPU |
 
-**Note:** Layout models use a specialized RT-DETR-based object detection framework from `docling-ibm-models`.
+**Note:** Layout models run through `AutoModelForObjectDetection`, reading their label map
+from the model repository's own `config.json`. Only `docling-layout-heron` also supports ONNXRuntime.
+
+**Deprecated:** `LayoutOptions` and `docling-layout-v2` are superseded by
+`LayoutObjectDetectionOptions`. `LayoutOptions` still works — it is translated onto the
+object-detection path — but selecting `DOCLING_LAYOUT_V2` warns and falls back to Heron.
 
 ### TableFormer Models (Table Structure)
 
@@ -203,6 +224,9 @@ The following table shows all processing stages in Docling, their model families
 | DocumentFigureClassifier-v2.5 | Transformers (ViT) | CPU, CUDA, MPS, XPU |
 
 ### OCR Engines
+
+Languages are given as BCP-47 tags for every engine; see
+[OCR engines](../concepts/OCR.md#language-selection).
 
 | OCR Engine | Backend | Language Support | Notes |
 |------------|---------|------------------|-------|
@@ -227,9 +251,24 @@ The following table shows all processing stages in Docling, their model families
 | `got_ocr` | GOT-OCR-2.0 | - | ✅ | ❌ | ❌ | ❌ | Markdown |
 | `phi4` | Phi-4-Multimodal | - | ✅ | ❌ | ❌ | ✅ | Markdown |
 | `qwen` | Qwen2.5-VL-3B | 3B | ✅ | ✅ | ❌ | ❌ | Markdown |
+| `nanonets_ocr2` | Nanonets-OCR2-3B | 3B | ✅ | ✅ | OpenAI-compatible<br/>LM Studio | ✅ | Markdown |
+| `nemotron_parse_v2` | NVIDIA Nemotron Parse 2.0 | 0.9B | ✅ | ✅ | ❌ | ✅ | Native layout with Markdown text and LaTeX tables |
+| `mineru2_pro` | MinerU2.5-Pro-2604 | 1.2B | ✅ | ✅ | OpenAI-compatible<br/>LM Studio | ❌ | Native two-step layout, text, formulas, and OTSL tables |
 | `gemma_12b` | Gemma-3-12B | 12B | ❌ | ✅ | ❌ | ❌ | Markdown |
 | `gemma_27b` | Gemma-3-27B | 27B | ❌ | ✅ | ❌ | ❌ | Markdown |
 | `dolphin` | Dolphin | - | ✅ | ❌ | ❌ | ❌ | Markdown |
+| `unlimited_ocr` | Unlimited-OCR | 3.34B (MoE) | ❌ | ❌ | OpenAI-compatible | ✅ | Markdown with layout blocks |
+
+`nanonets_ocr2` includes preset API overrides for OpenAI-compatible runtimes and LM Studio, and can also be used with vLLM runtimes.
+
+`mineru2_pro` runs MinerU's native two-step flow: page-level layout detection followed by
+type-specific recognition of the detected region crops. Its Transformers and API configurations
+use the official `opendatalab/MinerU2.5-Pro-2604-1.2B` repository. The MLX override uses the
+community-published `carlesonielfa/MinerU2.5-Pro-2604-1.2B-mlx-bf16` conversion because no official
+OpenDataLab MLX checkpoint is currently available. Image/chart analysis and cross-page table merging
+are not enabled by this preset.
+
+`unlimited_ocr` is served through an OpenAI-compatible endpoint: point `ApiVlmEngineOptions.url` at your own runtime. Its API override sets `skip_special_tokens=False`, without which the layout annotations are stripped from the completion.
 
 #### Picture Description Stage
 
@@ -252,11 +291,13 @@ The following table shows all processing stages in Docling, their model families
 ### Layout Detection
 
 ```python
-from docling.datamodel.pipeline_options import LayoutOptions
-from docling.datamodel.layout_model_specs import DOCLING_LAYOUT_HERON
+from docling.datamodel.pipeline_options import LayoutObjectDetectionOptions
 
 # Use Heron layout model (default)
-layout_options = LayoutOptions(model_spec=DOCLING_LAYOUT_HERON)
+layout_options = LayoutObjectDetectionOptions.from_preset("layout_heron_default")
+
+# Or a higher-accuracy variant
+layout_options = LayoutObjectDetectionOptions.from_preset("layout_egret_large")
 ```
 
 ### Table Structure Recognition
@@ -287,8 +328,9 @@ classifier_options = DocumentPictureClassifierOptions.from_preset("document_figu
 ```python
 from docling.datamodel.pipeline_options import TesseractOcrOptions
 
-# Use Tesseract with English and German
-ocr_options = TesseractOcrOptions(lang=["eng", "deu"])
+# Use Tesseract with English and German. Languages are BCP-47 tags;
+# `eng`/`deu` still work and canonicalize to `en-Latn`/`de-Latn`.
+ocr_options = TesseractOcrOptions(lang=["en", "de"])
 ```
 
 ### VLM Convert (Full Page)
@@ -310,10 +352,10 @@ options = VlmConvertOptions.from_preset(
 ### Picture Description
 
 ```python
-from docling.datamodel.pipeline_options import PictureDescriptionVlmOptions
+from docling.datamodel.pipeline_options import PictureDescriptionVlmEngineOptions
 
 # Use Granite Vision for detailed descriptions
-options = PictureDescriptionVlmOptions.from_preset("granite_vision")
+options = PictureDescriptionVlmEngineOptions.from_preset("granite_vision")
 ```
 
 ### Code & Formula Extraction

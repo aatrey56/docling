@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
 """Unit tests for PageAssembleModel."""
 
 from pathlib import Path
@@ -83,6 +86,107 @@ class TestSanitizeTextLigatures:
     def test_ligature_with_spurious_space_in_multiline(self, model):
         """Ligature with spurious space works correctly across multi-line input."""
         assert model.sanitize_text(["\ufb01 eld", "of view"]) == "field of view"
+
+    def test_ij_capital_ligature(self, model):
+        """U+0132 Ĳ → IJ (Dutch capital ligature)."""
+        assert model.sanitize_text(["\u0132ssel"]) == "IJssel"
+
+    def test_ij_small_ligature(self, model):
+        """U+0133 ĳ → ij (Dutch small ligature)."""
+        assert model.sanitize_text(["be\u0133"]) == "beij"
+
+    def test_private_use_glyph_stripped(self, model):
+        """U+F0A0 private-use glyph is discarded (emitted by some PDF fonts)."""
+        assert model.sanitize_text(["hello\uf0a0world"]) == "helloworld"
+
+    def test_private_use_glyph_with_spurious_space_stripped(self, model):
+        """U+F0A0 followed by a real word-boundary space preserves the space.
+
+        Unlike true ligatures (which are always intra-word), U+F0A0 maps to "".
+        When it sits between two actual words the trailing space is a genuine word
+        separator and must be re-emitted so the words remain distinct.
+        """
+        assert model.sanitize_text(["hello\uf0a0 world"]) == "hello world"
+
+    def test_pua_glyph_at_string_start(self, model):
+        """U+F0A0 at start of string is discarded, rest preserved."""
+        assert model.sanitize_text(["\uf0a0word"]) == "word"
+
+    def test_pua_glyph_at_string_end(self, model):
+        """U+F0A0 at end of string is discarded."""
+        assert model.sanitize_text(["word\uf0a0"]) == "word"
+
+    def test_pua_glyph_alone(self, model):
+        """U+F0A0 in isolation produces empty string."""
+        assert model.sanitize_text(["\uf0a0"]) == ""
+
+    def test_pua_glyph_preserves_word_boundary_space(self, model):
+        """U+F0A0 between words preserves the separating space."""
+        assert model.sanitize_text(["hello\uf0a0 world"]) == "hello world"
+
+    def test_pua_glyph_no_space_merges(self, model):
+        """U+F0A0 with no following space still merges adjacent chars."""
+        assert model.sanitize_text(["hello\uf0a0world"]) == "helloworld"
+
+    def test_ij_capital_standalone(self, model):
+        """U+0132 as standalone token preserves trailing space."""
+        # "IJ is een rivier" — IJ appears as a standalone word
+        assert model.sanitize_text(["\u0132 is"]) == "IJ is"
+
+    def test_regex_matches_new_codepoints(self, model):
+        """Verify the regex actually matches U+0132, U+0133, U+F0A0."""
+        import re
+
+        from docling.models.stages.page_assemble.page_assemble_model import _LIGATURE_RE
+
+        assert _LIGATURE_RE.search("\u0132") is not None, "U+0132 not matched by regex"
+        assert _LIGATURE_RE.search("\u0133") is not None, "U+0133 not matched by regex"
+        assert _LIGATURE_RE.search("\uf0a0") is not None, "U+F0A0 not matched by regex"
+
+
+class TestSanitizeTextHyphenation:
+    """Tests for end-of-line hyphen handling in sanitize_text()."""
+
+    @pytest.mark.parametrize(
+        ("lines", "expected"),
+        [
+            (["algo-", "rithms"], "algorithms"),
+            (["the veri-", "fication step"], "the verification step"),
+        ],
+    )
+    def test_attached_hyphen_joins_split_word(self, model, lines, expected):
+        """A hyphen attached to the previous word marks a word split and is dropped."""
+        assert model.sanitize_text(list(lines)) == expected
+
+    def test_attached_hyphen_on_non_alnum_token_is_kept(self, model):
+        """An underscore-bearing token is not treated as a split word (unchanged)."""
+        assert model.sanitize_text(["foo_bar-", "baz"]) == "foo_bar-baz"
+
+    @pytest.mark.parametrize(
+        ("lines", "expected"),
+        [
+            # Wrapped CLI flag, as reported: the dash must not be swallowed.
+            (
+                ["gsh create_diameter_peer -ip 10.0.8.72 -pn 1 -", "prio 3 -dh mme"],
+                "gsh create_diameter_peer -ip 10.0.8.72 -pn 1 - prio 3 -dh mme",
+            ),
+            # Separator dash between title parts.
+            (
+                ["editors, Computer Vision -", "ECCV 2020 , pages 564-580"],
+                "editors, Computer Vision - ECCV 2020 , pages 564-580",
+            ),
+            # Bullet marker isolated on its own line.
+            (
+                ["-", "Human Resources can see the unmasked TAX_ID"],
+                "- Human Resources can see the unmasked TAX_ID",
+            ),
+            # Wrapped negative number: the sign must survive.
+            (["cost is -", "5.00 USD"], "cost is - 5.00 USD"),
+        ],
+    )
+    def test_detached_hyphen_is_preserved(self, model, lines, expected):
+        """A hyphen following whitespace is a literal character, not a word split."""
+        assert model.sanitize_text(list(lines)) == expected
 
 
 def _make_page(hyperlinks: list[PdfHyperlink], page_height: float = 100.0) -> Page:

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
 """Backend to parse patents from the United States Patent Office (USPTO).
 
 The parsers included in this module can handle patent grants published since 1976 and
@@ -5,23 +8,38 @@ patent applications since 2001.
 The original files can be found in https://bulkdata.uspto.gov.
 
 Security Note:
-    This module uses defusedxml.sax.make_parser() with customized security settings
-    to protect against XML External Entity (XXE) attacks while allowing USPTO XML files
-    to be parsed. In addition, it includes safeguards against entity expansion attacks
-    and entity nesting depth. USPTO files contain DTD declarations that defusedxml
-    blocks by default, so we configure the parser with:
+    This module uses defusedxml.sax.make_parser() with security settings to protect
+    against XML External Entity (XXE) attacks and entity expansion attacks (Billion
+    Laughs/CWE-776). The parser is configured with:
 
-    - feature_external_ges: False (blocks external general entities)
-    - feature_external_pes: False (blocks external parameter entities)
-    - forbid_dtd: False (allows DTD declarations in the XML)
-    - forbid_entities: False (allows entity declarations)
-    - forbid_external: False (allows external references in declarations)
+    - feature_external_ges: False (blocks external general entity resolution)
+    - feature_external_pes: False (blocks external parameter entity resolution)
+    - forbid_dtd: False (allows DTD declarations required by USPTO XML format)
+    - forbid_entities: False (allows entity declarations including NDATA)
+    - forbid_external: False (allows SYSTEM declarations in DTD)
 
-    This configuration permits DTD declarations (required for USPTO files) while the
-    disabled external entity features prevent actual fetching of external resources,
-    effectively blocking XXE attacks. The parser processes the XML structure without
-    accessing any external files or URLs.
+    Security Analysis:
+    1. XXE Prevention: While external entities can be declared (forbid_external=False),
+       they are never resolved or fetched due to feature_external_ges=False and
+       feature_external_pes=False. This prevents XXE attacks.
+
+    2. Billion Laughs Mitigation: defusedxml's built-in entity expansion limits
+       (MAX_ENTITY_EXPANSION=10,000) prevent exponential entity expansion from
+       causing memory exhaustion. While not completely blocking entity expansion,
+       this limit prevents the worst-case denial-of-service scenarios.
+
+    3. NDATA Entities: USPTO files use NDATA entities for image references
+       (e.g., <!ENTITY img SYSTEM "file.tif" NDATA TIF>). These are unparsed
+       entities that don't expand inline and aren't fetched due to the external
+       entity resolution being disabled.
+
+    This configuration balances security with USPTO format compatibility. The key
+    insight is that defusedxml distinguishes between entity declaration (allowed)
+    and entity resolution/fetched (blocked), providing protection while allowing
+    the required DTD structure.
 """
+
+from __future__ import annotations
 
 import html
 import logging
@@ -35,9 +53,6 @@ from xml.sax import SAXParseException
 from xml.sax.handler import ContentHandler, feature_external_ges, feature_external_pes
 from xml.sax.xmlreader import AttributesImpl
 
-from bs4 import BeautifulSoup, Tag
-from defusedxml.common import DefusedXmlException
-from defusedxml.sax import make_parser
 from docling_core.types.doc import (
     DocItem,
     DocItemLabel,
@@ -54,10 +69,59 @@ from typing_extensions import Self, TypedDict, override
 from docling.backend.abstract_backend import DeclarativeDocumentBackend
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.document import InputDocument
+from docling.exceptions import DocumentLoadError
+
+_BS4_AVAILABLE: bool = False
+_BS4_IMPORT_ERROR: ImportError | None = None
+try:  # pragma: no cover - import-time guard
+    from bs4 import BeautifulSoup, Tag
+    from defusedxml.common import DefusedXmlException
+    from defusedxml.sax import make_parser
+
+    _BS4_AVAILABLE = True
+except ImportError as e:  # pragma: no cover - import-time guard
+    _BS4_IMPORT_ERROR = e
+
+_INSTALL_HINT = (
+    "The 'beautifulsoup4' and 'defusedxml' packages are required to process USPTO patent files. "
+    "Install them with `pip install 'docling-slim[format-xml-uspto]'`."
+)
 
 _log = logging.getLogger(__name__)
 
 XML_DECLARATION: Final[str] = '<?xml version="1.0" encoding="UTF-8"?>'
+
+_TABLE_START: Final[re.Pattern[str]] = re.compile(r"^<table ", re.MULTILINE)
+_TABLE_END: Final[str] = "</table>"
+
+
+def _extract_raw_tables(content: str) -> list[str]:
+    """Extract the raw ``<table>`` elements that start at the beginning of a line.
+
+    Each table spans from a line-leading ``<table `` to the first following
+    ``</table>``. The search runs in linear time: once no closing tag is left, no
+    further table can be completed, so the scan stops instead of rescanning the
+    remaining content for every unterminated opening tag.
+
+    Args:
+        content: The raw patent XML content.
+
+    Returns:
+        The table strings, in document order.
+    """
+    tables: list[str] = []
+    pos = 0
+    for match in _TABLE_START.finditer(content):
+        start = match.start()
+        if start < pos:
+            continue
+        end = content.find(_TABLE_END, match.end())
+        if end == -1:
+            break
+        pos = end + len(_TABLE_END)
+        tables.append(content[start:pos])
+
+    return tables
 
 
 @unique
@@ -81,6 +145,8 @@ class PatentHeading(Enum):
 class PatentUsptoDocumentBackend(DeclarativeDocumentBackend):
     @override
     def __init__(self, in_doc: InputDocument, path_or_stream: BytesIO | Path) -> None:
+        if not _BS4_AVAILABLE:
+            raise ImportError(_INSTALL_HINT) from _BS4_IMPORT_ERROR
         super().__init__(in_doc, path_or_stream)
 
         self.patent_content: str = ""
@@ -88,8 +154,11 @@ class PatentUsptoDocumentBackend(DeclarativeDocumentBackend):
 
         try:
             if isinstance(self.path_or_stream, BytesIO):
+                # The stream has already been read to the end to hash it, so
+                # rewind or every line of the patent reads as empty.
+                self.path_or_stream.seek(0)
                 while line := self.path_or_stream.readline().decode("utf-8"):
-                    if line.startswith("<!DOCTYPE") or line == "PATN\n":
+                    if line.startswith("<!DOCTYPE") or line.rstrip("\r\n") == "PATN":
                         self._set_parser(line)
                     self.patent_content += line
             elif isinstance(self.path_or_stream, Path):
@@ -99,13 +168,13 @@ class PatentUsptoDocumentBackend(DeclarativeDocumentBackend):
                             self._set_parser(line)
                         self.patent_content += line
         except Exception as exc:
-            raise RuntimeError(
+            raise DocumentLoadError(
                 f"Could not initialize USPTO backend for file with hash {self.document_hash}."
             ) from exc
 
     def _set_parser(self, doctype: str) -> None:
-        doctype_line = doctype.lower()
-        if doctype == "PATN\n":
+        doctype_line = doctype.rstrip("\r\n").lower()
+        if doctype_line == "patn":
             self.parser = PatentUsptoGrantAps()
         elif "us-patent-application-v4" in doctype_line:
             self.parser = PatentUsptoIce()
@@ -194,7 +263,6 @@ class PatentUsptoIce(PatentUspto):
     def __init__(self) -> None:
         """Build an instance of PatentUsptoIce class."""
         self.handler = PatentUsptoIce.PatentHandler()
-        self.pattern = re.compile(r"^(<table .*?</table>)", re.MULTILINE | re.DOTALL)
 
     def parse(self, patent_content: str) -> DoclingDocument | None:
         try:
@@ -220,7 +288,7 @@ class PatentUsptoIce(PatentUspto):
 
         doc = self.handler.doc
         if doc:
-            raw_tables = re.findall(self.pattern, patent_content)
+            raw_tables = _extract_raw_tables(patent_content)
             parsed_tables: list[TableData] = []
             _log.debug(f"Found {len(raw_tables)} tables to be parsed with XmlTable.")
             for table in raw_tables:
@@ -544,7 +612,6 @@ class PatentUsptoGrantV2(PatentUspto):
     def __init__(self) -> None:
         """Build an instance of PatentUsptoGrantV2 class."""
         self.handler = PatentUsptoGrantV2.PatentHandler()
-        self.pattern = re.compile(r"^(<table .*?</table>)", re.MULTILINE | re.DOTALL)
 
     @override
     def parse(self, patent_content: str) -> DoclingDocument | None:
@@ -571,7 +638,7 @@ class PatentUsptoGrantV2(PatentUspto):
 
         doc = self.handler.doc
         if doc:
-            raw_tables = re.findall(self.pattern, patent_content)
+            raw_tables = _extract_raw_tables(patent_content)
             parsed_tables: list[TableData] = []
             _log.debug(f"Found {len(raw_tables)} tables to be parsed with XmlTable.")
             for table in raw_tables:
@@ -1119,7 +1186,6 @@ class PatentUsptoAppV1(PatentUspto):
     def __init__(self) -> None:
         """Build an instance of PatentUsptoAppV1 class."""
         self.handler = PatentUsptoAppV1.PatentHandler()
-        self.pattern = re.compile(r"^(<table .*?</table>)", re.MULTILINE | re.DOTALL)
 
     @override
     def parse(self, patent_content: str) -> DoclingDocument | None:
@@ -1146,7 +1212,7 @@ class PatentUsptoAppV1(PatentUspto):
 
         doc = self.handler.doc
         if doc:
-            raw_tables = re.findall(self.pattern, patent_content)
+            raw_tables = _extract_raw_tables(patent_content)
             parsed_tables: list[TableData] = []
             _log.debug(f"Found {len(raw_tables)} tables to be parsed with XmlTable.")
             for table in raw_tables:
@@ -1682,7 +1748,8 @@ class XmlTable:
                                     end = ientry + 2
                                     shift = 1
 
-                                if end > len(tg_range["cell_offst"]):
+                                n_offst = len(tg_range["cell_offst"])
+                                if start < 1 or start > n_offst or end > n_offst:
                                     wrong_nbr_cols = True
                                     self.nbr_messages += 1
                                     if self.nbr_messages <= self.max_nbr_messages:
@@ -1844,6 +1911,7 @@ class HtmlEntity:
                 "U": "&#119880;",
                 "V": "&#119881;",
                 "W": "&#119882;",
+                "X": "&#119883;",
                 "Y": "&#119884;",
                 "Z": "&#119885;",
                 "a": "&#119886;",

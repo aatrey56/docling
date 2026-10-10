@@ -1,8 +1,10 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
+from __future__ import annotations
+
 import re
 from typing import TYPE_CHECKING, Callable, List, Optional
-
-if TYPE_CHECKING:
-    from typing import Any
 
 from docling_core.types.doc.document import (
     DocItemLabel,
@@ -10,22 +12,45 @@ from docling_core.types.doc.document import (
     Formatting,
     NodeItem,
 )
-from pylatexenc.latexwalker import (
-    LatexCharsNode,
-    LatexEnvironmentNode,
-    LatexGroupNode,
-    LatexMacroNode,
-    LatexMathNode,
-)
 
 from docling.backend.latex.constants import (
     MACROS_CITATION,
+    MACROS_COLOR_INLINE,
     MACROS_ESCAPED,
     MACROS_IGNORED,
     MACROS_SPACING,
     MACROS_STRUCTURAL,
     MACROS_TEXT_FORMATTING,
+    MACROS_TEXT_STYLE,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from typing import Any
+
+try:  # pragma: no cover - import-time guard
+    from pylatexenc.latexwalker import (
+        LatexCharsNode,
+        LatexEnvironmentNode,
+        LatexGroupNode,
+        LatexMacroNode,
+        LatexMathNode,
+        LatexSpecialsNode,
+    )
+except ImportError:
+    pass  # guarded by LatexDocumentBackend.__init__
+
+
+def iter_child_nodelists(node: Any) -> Iterator[list]:
+    """Yield the node lists of ``node`` and of its group arguments."""
+    if isinstance(node, (LatexGroupNode, LatexEnvironmentNode, LatexMathNode)):
+        if node.nodelist is not None:
+            yield node.nodelist
+    if isinstance(node, (LatexMacroNode, LatexEnvironmentNode, LatexSpecialsNode)):
+        if node.nodeargd and node.nodeargd.argnlist:
+            for arg in node.nodeargd.argnlist:
+                if isinstance(arg, LatexGroupNode) and arg.nodelist is not None:
+                    yield arg.nodelist
 
 
 class TextHelperMixin:
@@ -35,16 +60,16 @@ class TextHelperMixin:
 
         def _process_nodes(
             self,
-            nodes: "Any",
-            doc: "Any",
-            parent: "Any" = ...,
-            formatting: "Any" = ...,
-            text_label: "Any" = ...,
+            nodes: Any,
+            doc: Any,
+            parent: Any = ...,
+            formatting: Any = ...,
+            text_label: Any = ...,
         ) -> None: ...
-        def _extract_macro_arg(self, node: "Any") -> str: ...
+        def _extract_macro_arg(self, node: Any) -> str: ...
         def _expand_macros(self, latex_str: str) -> str: ...
         def _expand_custom_macro_invocation(
-            self, node: "Any", following_nodes: "Any"
+            self, node: Any, following_nodes: Any
         ) -> tuple[str, int]: ...
         def _parse_latex_fragment_to_text(self, latex_fragment: str) -> str: ...
 
@@ -63,13 +88,11 @@ class TextHelperMixin:
         if "\n\n" in text:
             parts = text.split("\n\n")
 
-            first_part = parts[0].strip()
-            if first_part:
-                text_buffer.append(first_part)
+            text_buffer.append(parts[0])
 
             flush_fn()
 
-            for part in parts[1:]:
+            for part in parts[1:-1]:
                 part_stripped = part.strip()
                 if part_stripped:
                     doc.add_text(
@@ -78,6 +101,8 @@ class TextHelperMixin:
                         text=part_stripped,
                         formatting=formatting,
                     )
+
+            text_buffer.append(parts[-1])
         else:
             text_buffer.append(text)
 
@@ -103,8 +128,62 @@ class TextHelperMixin:
         pattern = rf"\\begin\{{{re.escape(env_name)}\}}(?:\[.*?\])?(.*?)\\end\{{{re.escape(env_name)}\}}"
         match = re.search(pattern, latex_str, re.DOTALL)
         if match:
-            return match.group(1).strip()
+            return re.sub(r"\A(?:[ \t]*\r?\n)+", "", match.group(1)).rstrip()
         return latex_str
+
+    def _item_term(self, node: LatexMacroNode) -> str:
+        """Return the text of the ``\\item[...]`` term, or ``""`` if it has none."""
+        if node.nodeargd and node.nodeargd.argnlist:
+            arg = node.nodeargd.argnlist[0]
+            if isinstance(arg, LatexGroupNode):
+                return self._nodes_to_text(arg.nodelist).strip()
+        return ""
+
+    def _macro_node_to_text(self, node: LatexMacroNode, following_nodes) -> tuple:
+        """Return ``(text, consumed_following)`` for a single macro node."""
+        consumed = 0
+        if node.macroname in (MACROS_TEXT_FORMATTING | MACROS_TEXT_STYLE):
+            text = self._extract_macro_arg(node)
+            return (text or "", consumed)
+        if node.macroname in MACROS_COLOR_INLINE:
+            if node.nodeargd and node.nodeargd.argnlist:
+                text_arg = node.nodeargd.argnlist[-1]
+                if isinstance(text_arg, LatexGroupNode):
+                    return (self._nodes_to_text(text_arg.nodelist), consumed)
+            return ("", consumed)
+        if node.macroname in MACROS_CITATION:
+            return (node.latex_verbatim(), consumed)
+        if node.macroname == "\\":
+            return ("\n", consumed)
+        if node.macroname in ["~"]:
+            return (" ", consumed)
+        if node.macroname == "item":
+            term = self._item_term(node)
+            return (f"{term}: " if term else "", consumed)
+        if node.macroname in MACROS_ESCAPED:
+            return (node.macroname, consumed)
+        if node.macroname in self._custom_macros:
+            expansion, consumed = self._expand_custom_macro_invocation(
+                node, following_nodes
+            )
+            if self._custom_macro_num_args.get(node.macroname, 0) > 0:
+                return (self._parse_latex_fragment_to_text(expansion), consumed)
+            return (expansion, consumed)
+        if node.macroname in MACROS_SPACING or node.macroname in MACROS_IGNORED:
+            return ("", consumed)
+        arg_parts = []
+        if node.nodeargd and node.nodeargd.argnlist:
+            for arg in node.nodeargd.argnlist:
+                if arg is not None:
+                    if isinstance(arg, LatexGroupNode):
+                        text = self._nodes_to_text(arg.nodelist)
+                        if text:
+                            arg_parts.append(text)
+                    else:
+                        text = arg.latex_verbatim().strip("{} ")
+                        if text:
+                            arg_parts.append(text)
+        return (" ".join(arg_parts), consumed)
 
     def _nodes_to_text(self, nodes) -> str:
         text_parts = []
@@ -115,63 +194,16 @@ class TextHelperMixin:
             consumed_following = 0
             if isinstance(node, LatexCharsNode):
                 text_parts.append(node.chars)
-
             elif isinstance(node, LatexGroupNode):
                 text_parts.append(self._nodes_to_text(node.nodelist))
-
             elif isinstance(node, LatexMacroNode):
-                if node.macroname in MACROS_TEXT_FORMATTING:
-                    text = self._extract_macro_arg(node)
-                    if text:
-                        text_parts.append(text)
-                elif node.macroname in MACROS_CITATION:
-                    text_parts.append(node.latex_verbatim())
-                elif node.macroname == "\\":
-                    text_parts.append("\n")
-                elif node.macroname in ["~"]:
-                    text_parts.append(" ")
-                elif node.macroname == "item":
-                    if node.nodeargd and node.nodeargd.argnlist:
-                        arg = node.nodeargd.argnlist[0]
-                        if arg:
-                            opt_text = arg.latex_verbatim().strip("[] ")
-                            text_parts.append(f"{opt_text}: ")
-                elif node.macroname in MACROS_ESCAPED:
-                    text_parts.append(node.macroname)
-                elif node.macroname in self._custom_macros:
-                    expansion, consumed_following = (
-                        self._expand_custom_macro_invocation(node, nodes[idx + 1 :])
-                    )
-                    if self._custom_macro_num_args.get(node.macroname, 0) > 0:
-                        text_parts.append(self._parse_latex_fragment_to_text(expansion))
-                    else:
-                        text_parts.append(expansion)
-                elif (
-                    node.macroname in MACROS_SPACING or node.macroname in MACROS_IGNORED
-                ):
-                    # Spacing and ignored commands are silently discarded along
-                    # with their arguments to prevent values like "-1mm" leaking
-                    # as plain text (e.g. from \vspace{-1mm}, \hspace{0.2cm})
-                    pass
-                else:
-                    arg_parts = []
-                    if node.nodeargd and node.nodeargd.argnlist:
-                        for arg in node.nodeargd.argnlist:
-                            if arg is not None:
-                                if hasattr(arg, "nodelist"):
-                                    text = self._nodes_to_text(arg.nodelist)
-                                    if text:
-                                        arg_parts.append(text)
-                                else:
-                                    text = arg.latex_verbatim().strip("{} ")
-                                    if text:
-                                        arg_parts.append(text)
-                    if arg_parts:
-                        text_parts.append(" ".join(arg_parts))
-
+                text, consumed_following = self._macro_node_to_text(
+                    node, nodes[idx + 1 :]
+                )
+                if text:
+                    text_parts.append(text)
             elif isinstance(node, LatexMathNode):
                 text_parts.append(self._expand_macros(node.latex_verbatim()))
-
             elif isinstance(node, LatexEnvironmentNode):
                 if node.envname in ["equation", "align", "gather"]:
                     text_parts.append(node.latex_verbatim())

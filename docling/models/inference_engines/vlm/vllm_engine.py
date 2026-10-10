@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
 """vLLM-based VLM inference engine for high-throughput serving."""
 
 import logging
@@ -10,6 +13,7 @@ from docling.datamodel.accelerator_options import AcceleratorDevice, Accelerator
 from docling.datamodel.pipeline_options_vlm_model import TransformersPromptStyle
 from docling.datamodel.vlm_engine_options import VllmVlmEngineOptions
 from docling.models.inference_engines.vlm._utils import (
+    check_min_engine_version,
     format_prompt_for_vlm,
     preprocess_image_batch,
     resolve_model_artifacts_path,
@@ -18,6 +22,7 @@ from docling.models.inference_engines.vlm.base import (
     BaseVlmEngine,
     VlmEngineInput,
     VlmEngineOutput,
+    VlmEngineType,
 )
 from docling.utils.accelerator_utils import decide_device
 
@@ -48,6 +53,7 @@ class VllmVlmEngine(BaseVlmEngine):
         # Stops / outputs
         "stop",
         "stop_token_ids",
+        "include_stop_str_in_output",
         "skip_special_tokens",
         "spaces_between_special_tokens",
         # Search / length
@@ -67,6 +73,7 @@ class VllmVlmEngine(BaseVlmEngine):
         # Model/tokenizer/impl
         "tokenizer",
         "tokenizer_mode",
+        "model_impl",
         "download_dir",
         # Parallelism / memory / lengths
         "tensor_parallel_size",
@@ -88,7 +95,7 @@ class VllmVlmEngine(BaseVlmEngine):
         self,
         options: VllmVlmEngineOptions,
         accelerator_options: AcceleratorOptions,
-        artifacts_path: Optional[Union[Path, str]],
+        artifacts_path: Union[Path, str] | None,
         model_config: Optional["EngineModelConfig"] = None,
     ):
         """Initialize the vLLM engine.
@@ -105,7 +112,7 @@ class VllmVlmEngine(BaseVlmEngine):
         self.artifacts_path = artifacts_path
 
         # These will be set during initialization
-        self.device: Optional[str] = None
+        self.device: str | None = None
         self.llm: Any = None
         self.sampling_params: Any = None
         self.processor: Any = None
@@ -120,6 +127,11 @@ class VllmVlmEngine(BaseVlmEngine):
             return
 
         _log.info("Initializing vLLM VLM inference engine...")
+
+        check_min_engine_version(
+            VlmEngineType.VLLM,
+            self.model_config.min_engine_version if self.model_config else None,
+        )
 
         try:
             from transformers import AutoProcessor
@@ -197,12 +209,12 @@ class VllmVlmEngine(BaseVlmEngine):
             # Construct LLM kwargs (engine/load-time)
             llm_kwargs: Dict[str, Any] = {
                 "model": str(artifacts_path),
-                "model_impl": "transformers",
                 "limit_mm_per_prompt": {"image": 1},
                 "revision": revision,
                 "trust_remote_code": self.options.trust_remote_code,
                 **load_cfg,
             }
+            llm_kwargs["model_impl"] = self.options.model_impl
 
             if self.device == "cpu":
                 llm_kwargs.setdefault("enforce_eager", True)
@@ -284,7 +296,7 @@ class VllmVlmEngine(BaseVlmEngine):
         )
 
         # Format prompts
-        prompts: List[Optional[str]] = []
+        prompts: List[str | None] = []
         for input_data in input_batch:
             formatted_prompt = format_prompt_for_vlm(
                 prompt=input_data.prompt,
@@ -316,13 +328,25 @@ class VllmVlmEngine(BaseVlmEngine):
         )
 
         # Generate
+        _log.info(
+            "Running vLLM inference on %s image(s) (max_new_tokens=%s)...",
+            len(input_batch),
+            first_input.max_new_tokens,
+        )
         start_time = time.time()
         outputs = self.llm.generate(llm_inputs, sampling_params=sampling_params)
         generation_time = time.time() - start_time
 
-        _log.debug(
-            f"vLLM generated {len(outputs)} outputs in {generation_time:.2f}s "
-            f"({len(outputs) / generation_time:.1f} outputs/sec)"
+        total_generated_tokens = sum(
+            len(output.outputs[0].token_ids) if output.outputs else 0
+            for output in outputs
+        )
+        _log.info(
+            "vLLM generated %s tokens for %s image(s) in %.2f sec. (%.2f tok/s)",
+            total_generated_tokens,
+            len(outputs),
+            generation_time,
+            total_generated_tokens / generation_time if generation_time > 0 else 0.0,
         )
 
         # Create output objects

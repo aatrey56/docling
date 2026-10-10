@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
 """Backend to parse XBRL (eXtensible Business Reporting Language) documents.
 
 XBRL is a standard XML format used for business and financial reporting.
@@ -42,7 +45,7 @@ from docling.backend.html_backend import HTMLDocumentBackend
 from docling.datamodel.backend_options import HTMLBackendOptions, XBRLBackendOptions
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.document import InputDocument
-from docling.exceptions import OperationNotAllowed
+from docling.exceptions import DocumentLoadError, OperationNotAllowed
 
 _XBRL_AVAILABLE: bool = False
 _XBRL_IMPORT_ERROR: ImportError | None = None
@@ -84,13 +87,15 @@ class XBRLDocumentBackend(DeclarativeDocumentBackend):
         self,
         in_doc: InputDocument,
         path_or_stream: BytesIO | Path,
-        options: XBRLBackendOptions = XBRLBackendOptions(),
+        options: XBRLBackendOptions | None = None,
     ) -> None:
+        if options is None:
+            options = XBRLBackendOptions()
         # Check if arelle is available before proceeding
         if not _XBRL_AVAILABLE:
             raise ImportError(
                 "The 'arelle-release' package is required to process XBRL documents. "
-                "Please install it using `pip install 'docling[xbrl]'`"
+                "Please install it using `pip install 'docling-slim[format-xml-xbrl]'`"
             ) from _XBRL_IMPORT_ERROR
 
         super().__init__(in_doc, path_or_stream)
@@ -114,7 +119,11 @@ class XBRLDocumentBackend(DeclarativeDocumentBackend):
                     " 'options.enable_remote_fetch=True'. Either one or the other"
                     " needs to be enabled to load taxonomies."
                 )
-            with TemporaryDirectory() as tmpdir:
+            # Arelle keeps the taxonomy package zip files open for the lifetime
+            # of the model, which outlives this directory. On Windows, open
+            # files cannot be deleted, so the cleanup of this directory may
+            # leave stale files behind instead of raising.
+            with TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
                 tmp_path: Path = Path(tmpdir)
                 zip_paths: list[str] = []
                 if self.options.taxonomy:
@@ -176,7 +185,7 @@ class XBRLDocumentBackend(DeclarativeDocumentBackend):
             self.model_xbrl = model
             self.valid = True
         except Exception as exc:
-            raise RuntimeError(
+            raise DocumentLoadError(
                 "Could not initialize XBRL backend for file with hash"
                 f" {self.document_hash}."
             ) from exc
@@ -247,7 +256,7 @@ class XBRLDocumentBackend(DeclarativeDocumentBackend):
         """
         _log.debug("Starting XBRL instance conversion...")
         if not self.is_valid() or not self.model_xbrl:
-            raise RuntimeError("Invalid document with hash {self.document_hash}")
+            raise RuntimeError(f"Invalid document with hash {self.document_hash}")
 
         origin = DocumentOrigin(
             filename=self.file.name or "file",
@@ -311,21 +320,37 @@ class XBRLDocumentBackend(DeclarativeDocumentBackend):
 
             if fact.concept.isNumeric and fact.localName and fact.value:
                 # period
+                # Arelle adjusts date-only instants and end dates by one day
+                # (they denote the end of that day); `instantDate`/`endDate`
+                # report the dates as declared in the instance contexts.
+                # The properties are `date | None`, so guard against a
+                # malformed context producing a literal "None" in the cell.
                 period_text = ""
                 if fact.context is not None:
-                    if fact.context.isInstantPeriod:
-                        period_text = str(fact.context.instantDatetime.date())
-                    elif fact.context.isStartEndPeriod:
-                        period_text = f"{fact.context.startDatetime.date()} - {fact.context.endDatetime.date()}"
+                    if (
+                        fact.context.isInstantPeriod
+                        and fact.context.instantDate is not None
+                    ):
+                        period_text = str(fact.context.instantDate)
+                    elif (
+                        fact.context.isStartEndPeriod
+                        and fact.context.startDatetime is not None
+                        and fact.context.endDate is not None
+                    ):
+                        period_text = f"{fact.context.startDatetime.date()} - {fact.context.endDate}"
 
                 # unit
                 unit_text = ""
-                if (
-                    fact.unit is not None
-                    and fact.unit.measures
-                    and fact.unit.measures[0]
-                ):
-                    unit_text = fact.unit.measures[0][0].localName
+                if fact.unit is not None:
+                    # ModelUnit.measures is always a (numerators, denominators) pair,
+                    # rendered like Arelle's ModelUnit.value, e.g. "USD / shares"
+                    numerators, denominators = fact.unit.measures
+                    if numerators:
+                        unit_text = " ".join(m.localName for m in numerators)
+                        if denominators:
+                            unit_text += " / " + " ".join(
+                                m.localName for m in denominators
+                            )
 
                 # decimals
                 decimals_text = str(fact.decimals) if fact.decimals is not None else ""
